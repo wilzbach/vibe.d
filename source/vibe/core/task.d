@@ -1,15 +1,14 @@
 /**
 	Contains interfaces and enums for evented I/O drivers.
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
 module vibe.core.task;
 
 import vibe.core.sync;
-import vibe.internal.newconcurrency : newStdConcurrency;
-import vibe.utils.array;
+import vibe.internal.array : FixedRingBuffer;
 
 import core.thread;
 import std.exception;
@@ -28,10 +27,8 @@ struct Task {
 	private {
 		shared(TaskFiber) m_fiber;
 		size_t m_taskCounter;
-		static if (newStdConcurrency) {
-			import std.concurrency : ThreadInfo, Tid;
-			static ThreadInfo s_tidInfo;
-		}
+		import std.concurrency : ThreadInfo, Tid;
+		static ThreadInfo s_tidInfo;
 	}
 
 	private this(TaskFiber fiber, size_t task_counter)
@@ -74,17 +71,10 @@ struct Task {
 			return this.fiber.m_running && this.fiber.m_taskCounter == m_taskCounter;
 		}
 
-		static if (newStdConcurrency) {
-			// FIXME: this is not thread safe!
-			@property ref ThreadInfo tidInfo() { return m_fiber ? fiber.tidInfo : s_tidInfo; }
-			@property Tid tid() { return tidInfo.ident; }
-		} else {
-			@property Task tid() { return this; }
-		}
+		// FIXME: this is not thread safe!
+		@property ref ThreadInfo tidInfo() { return m_fiber ? fiber.tidInfo : s_tidInfo; }
+		@property Tid tid() { return tidInfo.ident; }
 	}
-
-	/// Reserved for internal use!
-	@property inout(MessageQueue) messageQueue() inout { assert(running, "Task is not running"); return fiber.messageQueue; }
 
 	T opCast(T)() const nothrow if (is(T == bool)) { return m_fiber !is null; }
 
@@ -108,11 +98,8 @@ struct Task {
 class TaskFiber : Fiber {
 	private {
 		Thread m_thread;
-		static if (newStdConcurrency) {
-			import std.concurrency : ThreadInfo;
-			ThreadInfo m_tidInfo;
-		}
-		MessageQueue m_messageQueue;
+		import std.concurrency : ThreadInfo;
+		ThreadInfo m_tidInfo;
 	}
 
 	protected {
@@ -122,11 +109,8 @@ class TaskFiber : Fiber {
 
 	protected this(void delegate() fun, size_t stack_size)
 	nothrow {
-		static if (__VERSION__ <= 2066) scope (failure) assert(false);
 		super(fun, stack_size);
 		m_thread = Thread.getThis();
-		scope (failure) assert(false);
-		m_messageQueue = new MessageQueue;
 	}
 
 	/** Returns the thread that owns this task.
@@ -137,10 +121,7 @@ class TaskFiber : Fiber {
 	*/
 	@property Task task() @safe nothrow { return Task(this, m_taskCounter); }
 
-	/// Reserved for internal use!
-	@property inout(MessageQueue) messageQueue() inout { return m_messageQueue; }
-
-	static if (newStdConcurrency) @property ref inout(ThreadInfo) tidInfo() inout nothrow { return m_tidInfo; }
+	@property ref inout(ThreadInfo) tidInfo() inout nothrow { return m_tidInfo; }
 
 	/** Blocks until the task has ended.
 	*/
@@ -168,137 +149,5 @@ class InterruptException : Exception {
 	this()
 	{
 		super("Task interrupted.");
-	}
-}
-
-
-class MessageQueue {
-	private {
-		InterruptibleTaskMutex m_mutex;
-		InterruptibleTaskCondition m_condition;
-		FixedRingBuffer!Variant m_queue;
-		FixedRingBuffer!Variant m_priorityQueue;
-		size_t m_maxMailboxSize = 0;
-		bool function(Task) m_onCrowding;
-	}
-
-	this()
-	{
-		m_mutex = new InterruptibleTaskMutex;
-		m_condition = new InterruptibleTaskCondition(m_mutex);
-		m_queue.capacity = 32;
-		m_priorityQueue.capacity = 8;
-	}
-
-	@property bool full() const { return m_maxMailboxSize > 0 && m_queue.length + m_priorityQueue.length >= m_maxMailboxSize; }
-
-	void clear()
-	{
-		m_mutex.performLocked!({
-			m_queue.clear();
-			m_priorityQueue.clear();
-		});
-		m_condition.notifyAll();
-	}
-
-	void setMaxSize(size_t count, bool function(Task tid) action)
-	{
-		m_maxMailboxSize = count;
-		m_onCrowding = action;
-	}
-
-	void send(Variant msg)
-	{
-		import vibe.core.log;
-		m_mutex.performLocked!({
-			if( this.full ){
-				if( !m_onCrowding ){
-					while(this.full)
-						m_condition.wait();
-				} else if( !m_onCrowding(Task.getThis()) ){
-					return;
-				}
-			}
-			assert(!this.full);
-
-			if( m_queue.full )
-				m_queue.capacity = (m_queue.capacity * 3) / 2;
-
-			m_queue.put(msg);
-		});
-		m_condition.notify();
-	}
-
-	void prioritySend(Variant msg)
-	{
-		m_mutex.performLocked!({
-			if (m_priorityQueue.full)
-				m_priorityQueue.capacity = (m_priorityQueue.capacity * 3) / 2;
-			m_priorityQueue.put(msg);
-		});
-		m_condition.notify();
-	}
-
-	void receive(scope bool delegate(Variant) filter, scope void delegate(Variant) handler)
-	{
-		bool notify;
-		scope (exit) if (notify) m_condition.notify();
-
-		Variant args;
-		m_mutex.performLocked!({
-			notify = this.full;
-			while (true) {
-				import vibe.core.log;
-				logTrace("looking for messages");
-				if (receiveQueue(m_priorityQueue, args, filter)) break;
-				if (receiveQueue(m_queue, args, filter)) break;
-				logTrace("received no message, waiting..");
-				m_condition.wait();
-				notify = this.full;
-			}
-		});
-
-		handler(args);
-	}
-
-	bool receiveTimeout(OPS...)(Duration timeout, scope bool delegate(Variant) filter, scope void delegate(Variant) handler)
-	{
-		import std.datetime;
-
-		bool notify;
-		scope (exit) if (notify) m_condition.notify();
-		auto limit_time = Clock.currTime(UTC()) + timeout;
-		Variant args;
-		if (!m_mutex.performLocked!({
-			notify = this.full;
-			while (true) {
-				if (receiveQueue(m_priorityQueue, args, filter)) break;
-				if (receiveQueue(m_queue, args, filter)) break;
-				auto now = Clock.currTime(UTC());
-				if (now >= limit_time) return false;
-				m_condition.wait(limit_time - now);
-				notify = this.full;
-			}
-			return true;
-		})) return false;
-
-		handler(args);
-		return true;
-	}
-
-	private static bool receiveQueue(OPS...)(ref FixedRingBuffer!Variant queue, ref Variant dst, scope bool delegate(Variant) filter)
-	{
-		auto r = queue[];
-		while (!r.empty) {
-			scope (failure) queue.removeAt(r);
-			auto msg = r.front;
-			if (filter(msg)) {
-				dst = msg;
-				queue.removeAt(r);
-				return true;
-			}
-			r.popFront();
-		}
-		return false;
 	}
 }

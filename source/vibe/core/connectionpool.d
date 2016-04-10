@@ -1,18 +1,17 @@
 /**
 	Generic connection pool for reusing persistent connections across fibers.
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
 module vibe.core.connectionpool;
 
 import vibe.core.log;
-import vibe.core.driver;
 
 import core.thread;
 import vibe.core.sync;
-import vibe.utils.memory;
+//import vibe.utils.memory;
 
 /**
 	Generic connection pool class.

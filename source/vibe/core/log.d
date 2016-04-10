@@ -20,6 +20,7 @@ import core.atomic;
 import core.thread;
 
 import std.traits : isSomeString;
+import std.range.primitives : isInputRange, isOutputRange;
 
 /**
 	Sets the minimum log level to be printed using the default console logger.
@@ -195,12 +196,6 @@ struct LogLine {
 class Logger {
 	LogLevel minLevel = LogLevel.min;
 
-	/** Whether the logger can handle multiple lines in a single beginLine/endLine.
-
-	   By default log text with newlines gets split into multiple log lines.
-	 */
-	protected bool multilineLogger = false;
-
 	private {
 		LogLine m_curLine;
 		Appender!string m_curLineText;
@@ -209,7 +204,7 @@ class Logger {
 	final bool acceptsLevel(LogLevel value) nothrow pure @safe { return value >= this.minLevel; }
 
 	/** Legacy logging interface relying on dynamic memory allocation.
-
+		
 		Override `beginLine`, `put`, `endLine` instead for a more efficient and
 		possibly allocation-free implementation.
 	*/
@@ -320,8 +315,6 @@ final class FileLogger : Logger {
 		m_curFile.flush();
 	}
 }
-
-import vibe.textfilter.html; // http://d.puremagic.com/issues/show_bug.cgi?id=7016
 
 /**
 	Logger implementation for logging to an HTML file with dynamic filtering support.
@@ -491,6 +484,70 @@ final class HTMLLogger : Logger {
 	}
 }
 
+
+/** Helper stuff.
+*/
+/** Writes the HTML escaped version of a given string to an output range.
+*/
+void filterHTMLEscape(R, S)(ref R dst, S str, HTMLEscapeFlags flags = HTMLEscapeFlags.escapeNewline)
+	if (isOutputRange!(R, dchar) && isInputRange!S)
+{
+	for (;!str.empty;str.popFront())
+		filterHTMLEscape(dst, str.front, flags);
+}
+
+/**
+	Writes the HTML escaped version of a character to an output range.
+*/
+void filterHTMLEscape(R)(ref R dst, dchar ch, HTMLEscapeFlags flags = HTMLEscapeFlags.escapeNewline )
+{
+	switch (ch) {
+		default:
+			if (flags & HTMLEscapeFlags.escapeUnknown) {
+				dst.put("&#");
+				dst.put(to!string(cast(uint)ch));
+				dst.put(';');
+			} else dst.put(ch);
+			break;
+		case '"':
+			if (flags & HTMLEscapeFlags.escapeQuotes) dst.put("&quot;");
+			else dst.put('"');
+			break;
+		case '\'':
+			if (flags & HTMLEscapeFlags.escapeQuotes) dst.put("&#39;");
+			else dst.put('\'');
+			break;
+		case '\r', '\n':
+			if (flags & HTMLEscapeFlags.escapeNewline) {
+				dst.put("&#");
+				dst.put(to!string(cast(uint)ch));
+				dst.put(';');
+			} else dst.put(ch);
+			break;
+		case 'a': .. case 'z': goto case;
+		case 'A': .. case 'Z': goto case;
+		case '0': .. case '9': goto case;
+		case ' ', '\t', '-', '_', '.', ':', ',', ';',
+			 '#', '+', '*', '?', '=', '(', ')', '/', '!',
+			 '%' , '{', '}', '[', ']', '`', '´', '$', '^', '~':
+			dst.put(cast(char)ch);
+			break;
+		case '<': dst.put("&lt;"); break;
+		case '>': dst.put("&gt;"); break;
+		case '&': dst.put("&amp;"); break;
+	}
+}
+
+
+enum HTMLEscapeFlags {
+	escapeMinimal = 0,
+	escapeQuotes = 1<<0,
+	escapeNewline = 1<<1,
+	escapeUnknown = 1<<2
+}
+/*****************************
+*/
+
 import std.conv;
 /**
 	A logger that logs in syslog format according to RFC 5424.
@@ -500,8 +557,7 @@ import std.conv;
 
 	Standards: Conforms to RFC 5424.
 */
-final class SyslogLogger : Logger {
-	import vibe.core.stream;
+final class SyslogLogger(OutputStream) : Logger {
 	private {
 		string m_hostName;
 		string m_appName;
@@ -774,31 +830,20 @@ private struct LogOutputRange {
 
 	void put(scope const(char)[] text)
 	{
-		if (text.empty)
-			return;
-
-		if (logger.multilineLogger)
-			logger.put(text);
-		else
-		{
-			auto rng = text.splitter('\n');
-			logger.put(rng.front);
-			rng.popFront;
-			foreach (line; rng)
-			{
-				logger.endLine();
-				logger.beginLine(info);
-				logger.put(line);
-			}
-		}
+		import std.string : indexOf;
+		auto idx = text.indexOf('\n');
+		if (idx >= 0) {
+			logger.put(text[0 .. idx]);
+			logger.endLine();
+			logger.beginLine(info);
+			logger.put(text[idx+1 .. $]);
+		} else logger.put(text);
 	}
 
 	void put(char ch) @trusted { put((&ch)[0 .. 1]); }
 
 	void put(dchar ch)
 	{
-		static import std.utf;
-		
 		if (ch < 128) put(cast(char)ch);
 		else {
 			char[4] buf;
@@ -815,31 +860,6 @@ private version (Windows) {
 	enum STD_OUTPUT_HANDLE = cast(DWORD)-11;
 	enum STD_ERROR_HANDLE = cast(DWORD)-12;
 	extern(System) HANDLE GetStdHandle(DWORD nStdHandle);
-}
-
-unittest
-{
-	static class TestLogger : Logger
-	{
-		string[] lines;
-		override void beginLine(ref LogLine msg) { lines.length += 1; }
-		override void put(scope const(char)[] text) { lines[$-1] ~= text; }
-		override void endLine() { }
-	}
-	auto logger = new TestLogger;
-	auto ll = (cast(shared(Logger))logger).lock();
-	auto rng = LogOutputRange(ll, __FILE__, __LINE__, LogLevel.info);
-	rng.formattedWrite("text\nwith\nnewlines");
-	rng.finalize();
-
-	assert(logger.lines == ["text", "with", "newlines"]);
-	logger.lines = null;
-	logger.multilineLogger = true;
-
-	rng = LogOutputRange(ll, __FILE__, __LINE__, LogLevel.info);
-	rng.formattedWrite("text\nwith\nnewlines");
-	rng.finalize();
-	assert(logger.lines == ["text\nwith\nnewlines"]);
 }
 
 unittest { // make sure the default logger doesn't allocate/is usable within finalizers

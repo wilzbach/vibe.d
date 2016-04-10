@@ -1,19 +1,22 @@
 /**
 	File handling functions and types.
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
 module vibe.core.file;
 
-public import vibe.core.stream;
-public import vibe.inet.url;
-
-import vibe.core.drivers.threadedfile; // temporarily needed tp get mkstemps to work
-import vibe.core.driver;
+//public import vibe.core.stream;
+//public import vibe.inet.url;
+import vibe.core.path;
 
 import core.stdc.stdio;
+import core.sys.posix.unistd;
+import core.sys.posix.fcntl;
+import core.sys.posix.sys.stat;
+import std.conv : octal;
+import vibe.core.log;
 import std.datetime;
 import std.exception;
 import std.file;
@@ -31,7 +34,8 @@ version(Posix){
 */
 FileStream openFile(Path path, FileMode mode = FileMode.read)
 {
-	return getEventDriver().openFile(path, mode);
+	assert(false);
+	//return eventDriver.openFile(path, mode);
 }
 /// ditto
 FileStream openFile(string path, FileMode mode = FileMode.read)
@@ -104,7 +108,7 @@ void appendToFile(string path, string data)
 */
 string readFileUTF8(Path path)
 {
-	import vibe.utils.string;
+	import vibe.internal.string;
 
 	return stripUTF8Bom(sanitizeUTF8(readFile(path)));
 }
@@ -151,7 +155,8 @@ FileStream createTempFile(string suffix = null)
 		assert(suffix.length <= int.max);
 		auto fd = mkstemps(templ.ptr, cast(int)suffix.length);
 		enforce(fd >= 0, "Failed to create temporary file.");
-		return new ThreadedFileStream(fd, Path(templ[0 .. $-1].idup), FileMode.createTrunc);
+		assert(false);
+		//return eventDriver.adoptFile(fd, Path(templ[0 .. $-1].idup), FileMode.createTrunc);
 	}
 }
 
@@ -312,7 +317,8 @@ int delegate(scope int delegate(ref FileInfo)) iterateDirectory(string path)
 */
 DirectoryWatcher watchDirectory(Path path, bool recursive = true)
 {
-	return getEventDriver().watchDirectory(path, recursive);
+	assert(false);
+	//return eventDriver.watchDirectory(path, recursive);
 }
 // ditto
 DirectoryWatcher watchDirectory(string path, bool recursive = true)
@@ -368,15 +374,198 @@ enum FileMode {
 /**
 	Accesses the contents of a file as a stream.
 */
-interface FileStream : RandomAccessStream {
+struct FileStream {
+	import std.algorithm.comparison : min;
+	import vibe.core.core : yield;
+	import core.stdc.errno;
+
+	version (Windows) {} else
+	{
+		enum O_BINARY = 0;
+	}
+
+	private {
+		int m_fileDescriptor;
+		Path m_path;
+		ulong m_size;
+		ulong m_ptr = 0;
+		FileMode m_mode;
+		bool m_ownFD = true;
+	}
+
+	this(Path path, FileMode mode)
+	{
+		auto pathstr = path.toNativeString();
+		final switch(mode){
+			case FileMode.read:
+				m_fileDescriptor = open(pathstr.toStringz(), O_RDONLY|O_BINARY);
+				break;
+			case FileMode.readWrite:
+				m_fileDescriptor = open(pathstr.toStringz(), O_RDWR|O_BINARY);
+				break;
+			case FileMode.createTrunc:
+				m_fileDescriptor = open(pathstr.toStringz(), O_RDWR|O_CREAT|O_TRUNC|O_BINARY, octal!644);
+				break;
+			case FileMode.append:
+				m_fileDescriptor = open(pathstr.toStringz(), O_WRONLY|O_CREAT|O_APPEND|O_BINARY, octal!644);
+				break;
+		}
+		if( m_fileDescriptor < 0 )
+			//throw new Exception(format("Failed to open '%s' with %s: %d", pathstr, cast(int)mode, errno));
+			throw new Exception("Failed to open file '"~pathstr~"'.");
+
+		this(m_fileDescriptor, path, mode);
+	}
+
+	this(int fd, Path path, FileMode mode)
+	{
+		assert(fd >= 0);
+		m_fileDescriptor = fd;
+		m_path = path;
+		m_mode = mode;
+
+		version(linux){
+			// stat_t seems to be defined wrong on linux/64
+			m_size = lseek(m_fileDescriptor, 0, SEEK_END);
+		} else {
+			stat_t st;
+			fstat(m_fileDescriptor, &st);
+			m_size = st.st_size;
+
+			// (at least) on windows, the created file is write protected
+			version(Windows){
+				if( mode == FileMode.createTrunc )
+					chmod(path.toNativeString().toStringz(), S_IREAD|S_IWRITE);
+			}
+		}
+		lseek(m_fileDescriptor, 0, SEEK_SET);
+
+		logDebug("opened file %s with %d bytes as %d", path.toNativeString(), m_size, m_fileDescriptor);
+	}
+
+	~this()
+	{
+		close();
+	}
+
+	@property int fd() { return m_fileDescriptor; }
+
 	/// The path of the file.
-	@property Path path() const nothrow;
+	@property Path path() const { return m_path; }
 
 	/// Determines if the file stream is still open
-	@property bool isOpen() const;
+	@property bool isOpen() const { return m_fileDescriptor >= 0; }
+	@property ulong size() const { return m_size; }
+	@property bool readable() const { return m_mode != FileMode.append; }
+	@property bool writable() const { return m_mode != FileMode.read; }
+
+	void takeOwnershipOfFD()
+	{
+		enforce(m_ownFD);
+		m_ownFD = false;
+	}
+
+	void seek(ulong offset)
+	{
+		version (Win32) {
+			enforce(offset <= off_t.max, "Cannot seek above 4GB on Windows x32.");
+			auto pos = lseek(m_fileDescriptor, cast(off_t)offset, SEEK_SET);
+		} else auto pos = lseek(m_fileDescriptor, offset, SEEK_SET);
+		enforce(pos == offset, "Failed to seek in file.");
+		m_ptr = offset;
+	}
+
+	ulong tell() { return m_ptr; }
 
 	/// Closes the file handle.
-	void close();
+	void close()
+	{
+		if( m_fileDescriptor != -1 && m_ownFD ){
+			.close(m_fileDescriptor);
+			m_fileDescriptor = -1;
+		}
+	}
+
+	@property bool empty() const { assert(this.readable); return m_ptr >= m_size; }
+	@property ulong leastSize() const { assert(this.readable); return m_size - m_ptr; }
+	@property bool dataAvailableForRead() { return true; }
+
+	const(ubyte)[] peek()
+	{
+		return null;
+	}
+
+	void read(ubyte[] dst)
+	{
+		assert(this.readable);
+		while (dst.length > 0) {
+			enforce(dst.length <= leastSize);
+			auto sz = min(dst.length, 4096);
+			enforce(.read(m_fileDescriptor, dst.ptr, cast(int)sz) == sz, "Failed to read data from disk.");
+			dst = dst[sz .. $];
+			m_ptr += sz;
+			yield();
+		}
+	}
+
+	void write(in ubyte[] bytes_)
+	{
+		const(ubyte)[] bytes = bytes_;
+		assert(this.writable);
+		while (bytes.length > 0) {
+			auto sz = min(bytes.length, 4096);
+			auto ret = .write(m_fileDescriptor, bytes.ptr, cast(int)sz);
+			import std.format : format;
+			enforce(ret == sz, format("Failed to write data to disk. %s %s %s %s", sz, errno, ret, m_fileDescriptor));
+			bytes = bytes[sz .. $];
+			m_ptr += sz;
+			yield();
+		}
+	}
+
+	void write(InputStream)(InputStream stream, ulong nbytes = 0)
+	{
+		writeDefault(stream, nbytes);
+	}
+
+	void flush()
+	{
+		assert(this.writable);
+	}
+
+	void finalize()
+	{
+		flush();
+	}
+}
+
+private void writeDefault(OutputStream, InputStream)(ref OutputStream dst, InputStream stream, ulong nbytes = 0)
+{
+	assert(false);
+	/*
+	static struct Buffer { ubyte[64*1024] bytes = void; }
+	auto bufferobj = FreeListRef!(Buffer, false)();
+	auto buffer = bufferobj.bytes[];
+
+	//logTrace("default write %d bytes, empty=%s", nbytes, stream.empty);
+	if (nbytes == 0) {
+		while (!stream.empty) {
+			size_t chunk = min(stream.leastSize, buffer.length);
+			assert(chunk > 0, "leastSize returned zero for non-empty stream.");
+			//logTrace("read pipe chunk %d", chunk);
+			stream.read(buffer[0 .. chunk]);
+			dst.write(buffer[0 .. chunk]);
+		}
+	} else {
+		while (nbytes > 0) {
+			size_t chunk = min(nbytes, buffer.length);
+			//logTrace("read pipe chunk %d", chunk);
+			stream.read(buffer[0 .. chunk]);
+			dst.write(buffer[0 .. chunk]);
+			nbytes -= chunk;
+		}
+	}
+	*/
 }
 
 

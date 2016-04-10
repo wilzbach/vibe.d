@@ -4,7 +4,7 @@
 	This module is modeled after std.concurrency, but provides a fiber-aware alternative
 	to it. All blocking operations will yield the calling fiber instead of blocking it.
 
-	Copyright: © 2013-2016 RejectedSoftware e.K.
+	Copyright: © 2013-2014 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -17,12 +17,9 @@ import std.typetuple;
 import std.variant;
 import std.string;
 import vibe.core.task;
-import vibe.utils.memory;
-import vibe.internal.newconcurrency;
-import vibe.internal.meta.traits : StripHeadConst;
+//import vibe.utils.memory;
 
-static if (newStdConcurrency) public import std.concurrency;
-else public import std.concurrency : MessageMismatch, OwnerTerminated, LinkTerminated, PriorityMessageException, MailboxFull, OnCrowding;
+public import std.concurrency;
 
 private extern (C) pure nothrow void _d_monitorenter(Object h);
 private extern (C) pure nothrow void _d_monitorexit(Object h);
@@ -247,12 +244,12 @@ unittest {
 	import vibe.core.concurrency;
 	import vibe.core.core;
 
-	static void compute(Task tid, Isolated!(double[]) array, size_t start_index)
+	static void compute(Tid tid, Isolated!(double[]) array, size_t start_index)
 	{
 		foreach( i; 0 .. array.length )
 			array[i] = (start_index + i) * 0.5;
 
-		sendCompat(tid, array.move());
+		send(tid, array.move());
 	}
 
 	void test()
@@ -267,14 +264,14 @@ unittest {
 		Isolated!(double[])[] subarrays = arr.splice(indices);
 
 		// start processing in threads
-		Task[] tids;
+		Tid[] tids;
 		foreach (i, idx; indices)
-			tids ~= runWorkerTaskH(&compute, Task.getThis(), subarrays[i].move(), idx);
+			tids ~= runWorkerTaskH(&compute, thisTid, subarrays[i].move(), idx).tid;
 
 		// collect results
 		auto resultarrays = new Isolated!(double[])[tids.length];
 		foreach( i, tid; tids )
-			resultarrays[i] = receiveOnlyCompat!(Isolated!(double[])).move();
+			resultarrays[i] = receiveOnly!(Isolated!(double[])).move();
 
 		// BUG: the arrays must be sorted here, but since there is no way to tell
 		// from where something was received, this is difficult here.
@@ -687,7 +684,7 @@ private struct ScopedRefAssociativeArray(K, V)
 /// private
 private string isolatedAggregateMethodsString(T)()
 {
-	import vibe.internal.meta.traits;
+	import vibe.internal.traits;
 
 	string ret = generateModuleImports!T();
 	//pragma(msg, "Type '"~T.stringof~"'");
@@ -989,8 +986,8 @@ template isWeaklyIsolated(T...)
 	else {
 		static if(is(T[0] == immutable)) enum bool isWeaklyIsolated = true;
 		else static if (is(T[0] == shared)) enum bool isWeaklyIsolated = true;
+		else static if (is(T[0] == Tid)) enum bool isWeaklyIsolated = true;
 		else static if (isInstanceOf!(Rebindable, T[0])) enum bool isWeaklyIsolated = isWeaklyIsolated!(typeof(T[0].get()));
-		else static if (is(T[0] == Tid)) enum bool isWeaklyIsolated = true; // Tid/MessageBox is not properly annotated with shared
 		else static if (is(T[0] : Throwable)) enum bool isWeaklyIsolated = true; // WARNING: this is unsafe, but needed for send/receive!
 		else static if (is(typeof(T[0].__isIsolatedType))) enum bool isWeaklyIsolated = true;
 		else static if (is(typeof(T[0].__isWeakIsolatedType))) enum bool isWeaklyIsolated = true;
@@ -1057,10 +1054,6 @@ unittest {
 	static assert(isWeaklyIsolated!G);
 	static assert(!isWeaklyIsolated!H);
 	static assert(!isWeaklyIsolated!I);
-}
-
-unittest {
-	static assert(isWeaklyIsolated!Tid);
 }
 
 
@@ -1130,13 +1123,11 @@ struct Future(T) {
 
 	See_also: $(D isWeaklyIsolated)
 */
-Future!(StripHeadConst!(ReturnType!CALLABLE)) async(CALLABLE, ARGS...)(CALLABLE callable, ARGS args)
+Future!(ReturnType!CALLABLE) async(CALLABLE, ARGS...)(CALLABLE callable, ARGS args)
 	if (is(typeof(callable(args)) == ReturnType!CALLABLE))
 {
 	import vibe.core.core;
-	import std.functional : toDelegate;
-
-	alias RET = StripHeadConst!(ReturnType!CALLABLE);
+	alias RET = ReturnType!CALLABLE;
 	Future!RET ret;
 	ret.init();
 	static void compute(FreeListRef!(shared(RET)) dst, CALLABLE callable, ARGS args) {
@@ -1145,7 +1136,7 @@ Future!(StripHeadConst!(ReturnType!CALLABLE)) async(CALLABLE, ARGS...)(CALLABLE 
 	static if (isWeaklyIsolated!CALLABLE && isWeaklyIsolated!ARGS) {
 		ret.m_task = runWorkerTaskH(&compute, ret.m_result, callable, args);
 	} else {
-		ret.m_task = runTask(toDelegate(&compute), ret.m_result, callable, args);
+		ret.m_task = runTask(&compute, ret.m_result, callable, args);
 	}
 	return ret;
 }
@@ -1157,6 +1148,7 @@ unittest {
 
 	void test()
 	{
+		static if (__VERSION__ >= 2065) {
 		auto val = async({
 			logInfo("Starting to compute value in worker task.");
 			sleep(500.msecs); // simulate some lengthy computation
@@ -1168,270 +1160,31 @@ unittest {
 		sleep(200.msecs); // simulate some lengthy computation
 		logInfo("Finished computation in main task. Waiting for async value.");
 		logInfo("Result: %s", val.getResult());
+		}
 	}
 }
 
-///
-unittest {
-	int sum(int a, int b)
-	{
-		return a + b;
-	}
 
-	static int sum2(int a, int b)
-	{
-		return a + b;
-	}
-
-	void test()
-	{
-		// Using a delegate will use runTask internally
-		assert(async(&sum, 2, 3).getResult() == 5);
-
-		// Using a static function will use runTaskWorker internally,
-		// if all arguments are weakly isolated
-		assert(async(&sum2, 2, 3).getResult() == 5);
-	}
-}
-
-unittest {
-	auto f = async({
-		immutable byte b = 1;
-		return b;
-	});
-	assert(f.getResult() == 1);
-}
-
-/******************************************************************************/
 /******************************************************************************/
 /* std.concurrency compatible interface for message passing                   */
 /******************************************************************************/
-/******************************************************************************/
 
-static if (newStdConcurrency) {
-	void send(ARGS...)(Task task, ARGS args) { std.concurrency.send(task.tidInfo.ident, args); }
-	void send(ARGS...)(Tid tid, ARGS args) { std.concurrency.send(tid, args); }
-	void prioritySend(ARGS...)(Task task, ARGS args) { std.concurrency.prioritySend(task.tidInfo.ident, args); }
-	void prioritySend(ARGS...)(Tid tid, ARGS args) { std.concurrency.prioritySend(tid, args); }
+void send(ARGS...)(Task task, ARGS args) { std.concurrency.send(task.tidInfo.ident, args); }
+void prioritySend(ARGS...)(Task task, ARGS args) { std.concurrency.prioritySend(task.tidInfo.ident, args); }
 
-	package class VibedScheduler : Scheduler {
-		import core.sync.mutex;
-		import vibe.core.core;
-		import vibe.core.sync;
+package class VibedScheduler : Scheduler {
+	import core.sync.mutex;
+	import vibe.core.core;
+	import vibe.core.sync;
 
-		override void start(void delegate() op) { op(); }
-		override void spawn(void delegate() op) { runTask(op); }
-		override void yield() {}
-		override @property ref ThreadInfo thisInfo() { return Task.getThis().tidInfo; }
-		override TaskCondition newCondition(Mutex m) {
-			scope (failure) assert(false);
-			version (VibeLibasyncDriver) {
-				import vibe.core.drivers.libasync;
-				if (LibasyncDriver.isControlThread)
-					return null;
-			}
-			setupDriver();
+	override void start(void delegate() op) { op(); }
+	override void spawn(void delegate() op) { runTask(op); }
+	override void yield() {}
+	override @property ref ThreadInfo thisInfo(){ return Task.getThis().tidInfo; }
+	override TaskCondition newCondition(Mutex m)
+	{
+		try {
 			return new TaskCondition(m);
-		}
+			} catch(Exception e) { assert(false, e.msg); }
 	}
-} else {
-	alias Tid = Task;
-
-	/// Returns the Tid of the caller (same as Task.getThis())
-	@property Tid thisTid() { return Task.getThis(); }
-
-	void send(ARGS...)(Tid tid, ARGS args) { sendCompat(tid, args); }
-	void prioritySend(ARGS...)(Tid tid, ARGS args) { prioritySendCompat(tid, args); }
-	void receive(OPS...)(OPS ops) { receiveCompat(ops); }
-	auto receiveOnly(ARGS...)() { return receiveOnlyCompat!ARGS(); }
-	bool receiveTimeout(OPS...)(Duration timeout, OPS ops) { return receiveTimeoutCompat(timeout, ops); }
-	void setMaxMailboxSize(Tid tid, size_t messages, OnCrowding on_crowding) { setMaxMailboxSizeCompat(tid, messages, on_crowding); }
-	void setMaxMailboxSize(Tid tid, size_t messages, bool function(Tid) on_crowding) { setMaxMailboxSizeCompat(tid, messages, on_crowding); }
-}
-
-
-// Compatibility implementation of `send` using vibe.d's own std.concurrency implementation
-void sendCompat(ARGS...)(Task tid, ARGS args)
-{
-	assert (tid != Task(), "Invalid task handle");
-	static assert(args.length > 0, "Need to send at least one value.");
-	foreach(A; ARGS){
-		static assert(isWeaklyIsolated!A, "Only objects with no unshared or unisolated aliasing may be sent, not "~A.stringof~".");
-	}
-	tid.messageQueue.send(Variant(IsolatedValueProxyTuple!ARGS(args)));
-}
-
-// Compatibility implementation of `prioritySend` using vibe.d's own std.concurrency implementation
-void prioritySendCompat(ARGS...)(Task tid, ARGS args)
-{
-	assert (tid != Task(), "Invalid task handle");
-	static assert(args.length > 0, "Need to send at least one value.");
-	foreach(A; ARGS){
-		static assert(isWeaklyIsolated!A, "Only objects with no unshared or unisolated aliasing may be sent, not "~A.stringof~".");
-	}
-	tid.messageQueue.prioritySend(Variant(IsolatedValueProxyTuple!ARGS(args)));
-}
-
-// TODO: handle special exception types
-
-// Compatibility implementation of `receive` using vibe.d's own std.concurrency implementation
-void receiveCompat(OPS...)(OPS ops)
-{
-	auto tid = Task.getThis();
-	assert(tid != Task.init, "Cannot receive task messages outside of a task.");
-	tid.messageQueue.receive(opsFilter(ops), opsHandler(ops));
-}
-
-// Compatibility implementation of `receiveOnly` using vibe.d's own std.concurrency implementation
-auto receiveOnlyCompat(ARGS...)()
-{
-	import std.algorithm : move;
-	ARGS ret;
-
-	receiveCompat(
-		(ARGS val) { move(val, ret); },
-		(LinkTerminated e) { throw e; },
-		(OwnerTerminated e) { throw e; },
-		(Variant val) { throw new MessageMismatch(format("Unexpected message type %s, expected %s.", val.type, ARGS.stringof)); }
-	);
-
-	static if(ARGS.length == 1) return ret[0];
-	else return tuple(ret);
-}
-
-// Compatibility implementation of `receiveTimeout` using vibe.d's own std.concurrency implementation
-bool receiveTimeoutCompat(OPS...)(Duration timeout, OPS ops)
-{
-	auto tid = Task.getThis();
-	assert(tid != Task.init, "Cannot receive task messages outside of a task.");
-	return tid.messageQueue.receiveTimeout!OPS(timeout, opsFilter(ops), opsHandler(ops));
-}
-
-// Compatibility implementation of `setMailboxSize` using vibe.d's own std.concurrency implementation
-void setMaxMailboxSizeCompat(Task tid, size_t messages, OnCrowding on_crowding)
-{
-	final switch(on_crowding){
-		case OnCrowding.block: setMaxMailboxSizeCompat(tid, messages, null); break;
-		case OnCrowding.throwException: setMaxMailboxSizeCompat(tid, messages, &onCrowdingThrow); break;
-		case OnCrowding.ignore: setMaxMailboxSizeCompat(tid, messages, &onCrowdingDrop); break;
-	}
-}
-
-// Compatibility implementation of `setMailboxSize` using vibe.d's own std.concurrency implementation
-void setMaxMailboxSizeCompat(Task tid, size_t messages, bool function(Task) on_crowding)
-{
-	tid.messageQueue.setMaxSize(messages, on_crowding);
-}
-
-unittest {
-	static class CLS {}
-	static assert(is(typeof(sendCompat(Task.init, makeIsolated!CLS()))));
-	static assert(is(typeof(sendCompat(Task.init, 1))));
-	static assert(is(typeof(sendCompat(Task.init, 1, "str", makeIsolated!CLS()))));
-	static assert(!is(typeof(sendCompat(Task.init, new CLS))));
-	static assert(is(typeof(receiveCompat((Isolated!CLS){}))));
-	static assert(is(typeof(receiveCompat((int){}))));
-	static assert(is(typeof(receiveCompat!(void delegate(int, string, Isolated!CLS))((int, string, Isolated!CLS){}))));
-	static assert(!is(typeof(receiveCompat((CLS){}))));
-}
-
-private bool onCrowdingThrow(Task tid){
-	import std.concurrency : Tid;
-	throw new MailboxFull(Tid());
-}
-
-private bool onCrowdingDrop(Task tid){
-	return false;
-}
-
-private struct IsolatedValueProxyTuple(T...)
-{
-	staticMap!(IsolatedValueProxy, T) fields;
-
-	this(ref T values)
-	{
-		foreach (i, Ti; T) {
-			static if (isInstanceOf!(IsolatedSendProxy, IsolatedValueProxy!Ti)) {
-				fields[i] = IsolatedValueProxy!Ti(values[i].unsafeGet());
-			} else fields[i] = values[i];
-		}
-	}
-}
-
-private template IsolatedValueProxy(T)
-{
-	static if (isInstanceOf!(IsolatedRef, T) || isInstanceOf!(IsolatedArray, T) || isInstanceOf!(IsolatedAssociativeArray, T)) {
-		alias IsolatedValueProxy = IsolatedSendProxy!(T.BaseType);
-	} else {
-		alias IsolatedValueProxy = T;
-	}
-}
-
-/+unittest {
-	static class Test {}
-	void test() {
-		Task.getThis().send(new immutable Test, makeIsolated!Test());
-	}
-}+/
-
-private struct IsolatedSendProxy(T) { alias BaseType = T; T value; }
-
-private bool callBool(F, T...)(F fnc, T args)
-{
-	static string caller(string prefix)
-	{
-		import std.conv;
-		string ret = prefix ~ "fnc(";
-		foreach (i, Ti; T) {
-			static if (i > 0) ret ~= ", ";
-			static if (isInstanceOf!(IsolatedSendProxy, Ti)) ret ~= "assumeIsolated(args["~to!string(i)~"].value)";
-			else ret ~= "args["~to!string(i)~"]";
-		}
-		ret ~= ");";
-		return ret;
-	}
-	static assert(is(ReturnType!F == bool) || is(ReturnType!F == void),
-		"Message handlers must return either bool or void.");
-	static if (is(ReturnType!F == bool)) mixin(caller("return "));
-	else {
-		mixin(caller(""));
-		return true;
-	}
-}
-
-private bool delegate(Variant) opsFilter(OPS...)(OPS ops)
-{
-	return (Variant msg) {
-		if (msg.convertsTo!Throwable) return true;
-		foreach (i, OP; OPS)
-			if (matchesHandler!OP(msg))
-				return true;
-		return false;
-	};
-}
-
-private void delegate(Variant) opsHandler(OPS...)(OPS ops)
-{
-	return (Variant msg) {
-		foreach (i, OP; OPS) {
-			alias PTypes = ParameterTypeTuple!OP;
-			if (matchesHandler!OP(msg)) {
-				static if (PTypes.length == 1 && is(PTypes[0] == Variant)) {
-					if (callBool(ops[i], msg)) return; // WARNING: proxied isolated values will go through verbatim!
-				} else {
-					auto msgt = msg.get!(IsolatedValueProxyTuple!PTypes);
-					if (callBool(ops[i], msgt.fields)) return;
-				}
-			}
-		}
-		if (msg.convertsTo!Throwable)
-			throw msg.get!Throwable();
-	};
-}
-
-private bool matchesHandler(F)(Variant msg)
-{
-	alias PARAMS = ParameterTypeTuple!F;
-	if (PARAMS.length == 1 && is(PARAMS[0] == Variant)) return true;
-	else return msg.convertsTo!(IsolatedValueProxyTuple!PARAMS);
 }

@@ -1,29 +1,19 @@
 /**
 	TCP/UDP connection and server handling.
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
 module vibe.core.net;
 
-public import vibe.core.stream;
-public import std.socket : AddressFamily;
-
-import vibe.core.driver;
+import eventcore.core;
+import std.exception : enforce;
+import std.format : format;
+import std.functional : toDelegate;
+import std.socket : AddressFamily, UnknownAddress;
 import vibe.core.log;
-
-import core.sys.posix.netinet.in_;
-import core.time;
-import std.exception;
-import std.functional;
-import std.string;
-version(Windows) {
-	static if (__VERSION__ >= 2070)
-		import std.c.windows.winsock;
-	else
-		import core.sys.windows.winsock2;
-}
+import vibe.internal.async;
 
 
 /**
@@ -39,7 +29,13 @@ NetworkAddress resolveHost(string host, AddressFamily address_family = AddressFa
 /// ditto
 NetworkAddress resolveHost(string host, ushort address_family, bool use_dns = true)
 {
-	return getEventDriver().resolveHost(host, address_family, use_dns);
+	NetworkAddress ret;
+	ret.family = address_family;
+	if (host == "127.0.0.1") {
+		ret.family = AddressFamily.INET;
+		ret.sockAddrInet4.sin_addr.s_addr = 0x0100007F;
+	} else assert(false);
+	return ret;
 }
 
 
@@ -54,7 +50,7 @@ NetworkAddress resolveHost(string host, ushort address_family, bool use_dns = tr
 	interface on which the server socket is supposed to listen for connections.
 	By default, all IPv4 and IPv6 interfaces will be used.
 */
-TCPListener[] listenTCP(ushort port, void delegate(TCPConnection stream) connection_callback, TCPListenOptions options = TCPListenOptions.defaults)
+TCPListener[] listenTCP(ushort port, TCPConnectionDelegate connection_callback, TCPListenOptions options = TCPListenOptions.defaults)
 {
 	TCPListener[] ret;
 	try ret ~= listenTCP(port, connection_callback, "::", options);
@@ -65,9 +61,15 @@ TCPListener[] listenTCP(ushort port, void delegate(TCPConnection stream) connect
 	return ret;
 }
 /// ditto
-TCPListener listenTCP(ushort port, void delegate(TCPConnection stream) connection_callback, string address, TCPListenOptions options = TCPListenOptions.defaults)
+TCPListener listenTCP(ushort port, TCPConnectionDelegate connection_callback, string address, TCPListenOptions options = TCPListenOptions.defaults)
 {
-	return getEventDriver().listenTCP(port, connection_callback, address, options);
+	auto addr = resolveHost(address);
+	addr.port = port;
+	auto sock = eventDriver.listenStream(addr.toUnknownAddress, (StreamListenSocketFD ls, StreamSocketFD s) @safe nothrow {
+		import vibe.core.core : runTask;
+		runTask(connection_callback, TCPConnection(s));
+	});
+	return TCPListener(sock);
 }
 
 /**
@@ -75,12 +77,12 @@ TCPListener listenTCP(ushort port, void delegate(TCPConnection stream) connectio
 
 	This function is the same as listenTCP but takes a function callback instead of a delegate.
 */
-TCPListener[] listenTCP_s(ushort port, void function(TCPConnection stream) connection_callback, TCPListenOptions options = TCPListenOptions.defaults)
+TCPListener[] listenTCP_s(ushort port, TCPConnectionFunction connection_callback, TCPListenOptions options = TCPListenOptions.defaults)
 {
 	return listenTCP(port, toDelegate(connection_callback), options);
 }
 /// ditto
-TCPListener listenTCP_s(ushort port, void function(TCPConnection stream) connection_callback, string address, TCPListenOptions options = TCPListenOptions.defaults)
+TCPListener listenTCP_s(ushort port, TCPConnectionFunction connection_callback, string address, TCPListenOptions options = TCPListenOptions.defaults)
 {
 	return listenTCP(port, toDelegate(connection_callback), address, options);
 }
@@ -88,31 +90,22 @@ TCPListener listenTCP_s(ushort port, void function(TCPConnection stream) connect
 /**
 	Establishes a connection to the given host/port.
 */
-TCPConnection connectTCP(string host, ushort port, string bind_interface = null, ushort bind_port = 0)
+TCPConnection connectTCP(string host, ushort port)
 {
 	NetworkAddress addr = resolveHost(host);
 	addr.port = port;
-	NetworkAddress bind_address;
-	if (bind_interface.length) bind_address = resolveHost(bind_interface, addr.family);
-	else {
-		bind_address.family = addr.family;
-		if (addr.family == AF_INET) bind_address.sockAddrInet4.sin_addr.s_addr = 0;
-		else bind_address.sockAddrInet6.sin6_addr.s6_addr[] = 0;
-	}
-	bind_address.port = bind_port;
-	return getEventDriver().connectTCP(addr, bind_address);
+	return connectTCP(addr);
 }
 /// ditto
-TCPConnection connectTCP(NetworkAddress addr, NetworkAddress bind_address = anyAddress)
+TCPConnection connectTCP(NetworkAddress addr)
 {
-	if (bind_address.family == AF_UNSPEC) {
-		bind_address.family = addr.family;
-		if (addr.family == AF_INET) bind_address.sockAddrInet4.sin_addr.s_addr = 0;
-		else bind_address.sockAddrInet6.sin6_addr.s6_addr[] = 0;
-		bind_address.port = 0;
-	}
-	enforce(addr.family == bind_address.family, "Destination address and bind address have different address families.");
-	return getEventDriver().connectTCP(addr, bind_address);
+	import std.conv : to;
+
+	scope uaddr = new UnknownAddress;
+	addr.toUnknownAddress(uaddr);
+	auto result = eventDriver.asyncAwait!"connectStream"(uaddr);
+	enforce(result[1] == ConnectStatus.connected, "Failed to connect to "~addr.toString()~": "~result[1].to!string);
+	return TCPConnection(result[0]);
 }
 
 
@@ -121,23 +114,23 @@ TCPConnection connectTCP(NetworkAddress addr, NetworkAddress bind_address = anyA
 */
 UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
 {
-	return getEventDriver().listenUDP(port, bind_address);
+	assert(false);
 }
 
-NetworkAddress anyAddress()
-{
-	NetworkAddress ret;
-	ret.family = AF_UNSPEC;
-	return ret;
-}
 
-version(VibeLibasyncDriver) {
-	public import libasync.events : NetworkAddress;
-} else {
+/// Callback invoked for incoming TCP connections.
+@safe nothrow alias TCPConnectionDelegate = void delegate(TCPConnection stream);
+/// ditto
+@safe nothrow alias TCPConnectionFunction = void delegate(TCPConnection stream);
+
+
 /**
 	Represents a network/socket address.
 */
 struct NetworkAddress {
+	version (Windows) import std.c.windows.winsock;
+	else import core.sys.posix.netinet.in_;
+
 	@safe:
 
 	private union {
@@ -205,15 +198,7 @@ struct NetworkAddress {
 	string toAddressString()
 	const {
 		import std.array : appender;
-		auto ret = appender!string();
-		ret.reserve(40);
-		toAddressString(str => ret.put(str));
-		return ret.data;
-	}
-	/// ditto
-	void toAddressString(scope void delegate(const(char)[]) @safe sink)
-	const {
-		import std.array : appender;
+		import std.string : format;
 		import std.format : formattedWrite;
 		ubyte[2] _dummy = void; // Workaround for DMD regression in master
 
@@ -221,16 +206,17 @@ struct NetworkAddress {
 			default: assert(false, "toAddressString() called for invalid address family.");
 			case AF_INET:
 				ubyte[4] ip = () @trusted { return (cast(ubyte*)&addr_ip4.sin_addr.s_addr)[0 .. 4]; } ();
-				sink.formattedWrite("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-				break;
+				return format("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 			case AF_INET6:
 				ubyte[16] ip = addr_ip6.sin6_addr.s6_addr;
+				auto ret = appender!string();
+				ret.reserve(40);
 				foreach (i; 0 .. 8) {
-					if (i > 0) sink(":");
+					if (i > 0) ret.put(':');
 					_dummy[] = ip[i*2 .. i*2+2];
-					sink.formattedWrite("%x", bigEndianToNative!ushort(_dummy));
+					ret.formattedWrite("%x", bigEndianToNative!ushort(_dummy));
 				}
-				break;
+				return ret.data;
 		}
 	}
 
@@ -238,27 +224,24 @@ struct NetworkAddress {
 	*/
 	string toString()
 	const {
-		import std.array : appender;
-		auto ret = appender!string();
-		toString(str => ret.put(str));
-		return ret.data;
-	}
-	/// ditto
-	void toString(scope void delegate(const(char)[]) @safe sink)
-	const {
-		import std.format : formattedWrite;
+		auto ret = toAddressString();
 		switch (this.family) {
 			default: assert(false, "toString() called for invalid address family.");
-			case AF_INET:
-				toAddressString(sink);
-				sink.formattedWrite(":%s", port);
-				break;
-			case AF_INET6:
-				sink("[");
-				toAddressString(sink);
-				sink.formattedWrite("]:%s", port);
-				break;
+			case AF_INET: return ret ~ format(":%s", port);
+			case AF_INET6: return format("[%s]:%s", ret, port);
 		}
+	}
+
+	UnknownAddress toUnknownAddress()
+	const {
+		auto ret = new UnknownAddress;
+		toUnknownAddress(ret);
+		return ret;
+	}
+
+	void toUnknownAddress(scope UnknownAddress addr)
+	const {
+		*addr.name = *this.sockAddr;
 	}
 
 	version(Have_libev) {}
@@ -274,87 +257,242 @@ struct NetworkAddress {
 		}
 	}
 }
-}
 
 /**
 	Represents a single TCP connection.
 */
-interface TCPConnection : ConnectionStream {
-	/// Used to disable Nagle's algorithm.
-	@property void tcpNoDelay(bool enabled);
-	/// ditto
-	@property bool tcpNoDelay() const;
+struct TCPConnection {
+	@safe:
 
+	import core.time : seconds;
+	import vibe.internal.array : FixedRingBuffer;
+	//static assert(isConnectionStream!TCPConnection);
 
-	/// Enables TCP keep-alive packets.
-	@property void keepAlive(bool enable);
-	/// ditto
-	@property bool keepAlive() const;
+	struct Context {
+		BatchBuffer!ubyte readBuffer;
+	}
 
-	/// Controls the read time out after which the connection is closed automatically.
-	@property void readTimeout(Duration duration);
-	/// ditto
-	@property Duration readTimeout() const;
+	private {
+		StreamSocketFD m_socket;
+		Context* m_context;
+	}
 
-	/// Returns the IP address of the connected peer.
-	@property string peerAddress() const;
+	private this(StreamSocketFD socket)
+	nothrow {
+		m_socket = socket;
+		m_context = &eventDriver.userData!Context(socket);
+		m_context.readBuffer.capacity = 4096;
+	}
 
-	/// The local/bind address of the underlying socket.
-	@property NetworkAddress localAddress() const;
+	this(this)
+	nothrow {
+		if (m_socket != StreamSocketFD.invalid)
+			eventDriver.addRef(m_socket);
+	}
 
-	/// The address of the connected peer.
-	@property NetworkAddress remoteAddress() const;
+	~this()
+	nothrow {
+		if (m_socket != StreamSocketFD.invalid)
+			eventDriver.releaseRef(m_socket);
+	}
+
+	@property void tcpNoDelay(bool enabled) { eventDriver.setTCPNoDelay(m_socket, enabled); }
+	@property bool tcpNoDelay() const { assert(false); }
+	@property void keepAlive(bool enable) { assert(false); }
+	@property bool keepAlive() const { assert(false); }
+	@property void readTimeout(Duration duration) { }
+	@property Duration readTimeout() const { assert(false); }
+	@property string peerAddress() const { return ""; }
+	@property NetworkAddress localAddress() const { return NetworkAddress.init; }
+	@property NetworkAddress remoteAddress() const { return NetworkAddress.init; }
+	@property bool connected()
+	const {
+		if (m_socket == StreamSocketFD.invalid) return false;
+		auto s = eventDriver.getConnectionState(m_socket);
+		return s >= ConnectionState.connected && s < ConnectionState.activeClose;
+	}
+	@property bool empty() { return leastSize == 0; }
+	@property ulong leastSize() { waitForData(); return m_context.readBuffer.length; }
+	@property bool dataAvailableForRead() { return waitForData(0.seconds); }
+	
+	void close()
+	nothrow {
+		//logInfo("close %s", cast(int)m_fd);
+		if (m_socket != StreamSocketFD.invalid) {
+			eventDriver.shutdownSocket(m_socket);
+			eventDriver.releaseRef(m_socket);
+			m_socket = StreamSocketFD.invalid;
+			m_context = null;
+		}
+	}
+	
+	bool waitForData(Duration timeout = Duration.max)
+	{
+mixin(tracer);
+		// TODO: timeout!!
+		if (m_context.readBuffer.length > 0) return true;
+		auto mode = timeout <= 0.seconds ? IOMode.immediate : IOMode.once;
+		auto res = eventDriver.asyncAwait!"readSocket"(m_socket, m_context.readBuffer.peekDst(), mode);
+		logTrace("Socket %s, read %s bytes: %s", res[0], res[2], res[1]);
+
+		assert(m_context.readBuffer.length == 0);
+		m_context.readBuffer.putN(res[2]);
+		switch (res[1]) {
+			default:
+				logInfo("read status %s", res[1]);
+				throw new Exception("Error reading data from socket.");
+			case IOStatus.ok: break;
+			case IOStatus.wouldBlock: assert(mode == IOMode.immediate); break;
+			case IOStatus.disconnected: break;
+		}
+
+		return m_context.readBuffer.length > 0;
+	}
+
+	const(ubyte)[] peek() { return m_context.readBuffer.peek(); }
+
+	void skip(ulong count)
+	{
+		import std.algorithm.comparison : min;
+
+		while (count > 0) {
+			waitForData();
+			auto n = min(count, m_context.readBuffer.length);
+			m_context.readBuffer.popFrontN(n);
+			if (m_context.readBuffer.empty) m_context.readBuffer.clear(); // start filling at index 0 again
+			count -= n;
+		}
+	}
+
+	void read(ubyte[] dst)
+	{
+mixin(tracer);
+		import std.algorithm.comparison : min;
+		while (dst.length > 0) {
+			enforce(waitForData(), "Reached end of stream while reading data.");
+			assert(m_context.readBuffer.length > 0);
+			auto l = min(dst.length, m_context.readBuffer.length);
+			m_context.readBuffer.read(dst[0 .. l]);
+			if (m_context.readBuffer.empty) m_context.readBuffer.clear(); // start filling at index 0 again
+			dst = dst[l .. $];
+		}
+	}
+
+	void write(in ubyte[] bytes)
+	{
+mixin(tracer);
+		if (bytes.length == 0) return;
+
+		auto res = eventDriver.asyncAwait!"writeSocket"(m_socket, bytes, IOMode.all);
+		
+		switch (res[1]) {
+			default:
+				throw new Exception("Error writing data to socket.");
+			case IOStatus.ok: break;
+			case IOStatus.disconnected: break;
+
+		}
+	}
+
+	void flush() {
+mixin(tracer);
+	}
+	void finalize() {}
+	void write(InputStream)(InputStream stream, ulong nbytes = 0) { writeDefault(stream, nbytes); }
+
+	private void writeDefault(InputStream)(InputStream stream, ulong nbytes = 0)
+	{
+		import std.algorithm.comparison : min;
+
+		static struct Buffer { ubyte[64*1024 - 4*size_t.sizeof] bytes = void; }
+		scope bufferobj = new Buffer; // FIXME: use heap allocation
+		auto buffer = bufferobj.bytes[];
+
+		//logTrace("default write %d bytes, empty=%s", nbytes, stream.empty);
+		if( nbytes == 0 ){
+			while( !stream.empty ){
+				size_t chunk = min(stream.leastSize, buffer.length);
+				assert(chunk > 0, "leastSize returned zero for non-empty stream.");
+				//logTrace("read pipe chunk %d", chunk);
+				stream.read(buffer[0 .. chunk]);
+				write(buffer[0 .. chunk]);
+			}
+		} else {
+			while( nbytes > 0 ){
+				size_t chunk = min(nbytes, buffer.length);
+				//logTrace("read pipe chunk %d", chunk);
+				stream.read(buffer[0 .. chunk]);
+				write(buffer[0 .. chunk]);
+				nbytes -= chunk;
+			}
+		}
+	}
 }
 
 
 /**
 	Represents a listening TCP socket.
 */
-interface TCPListener {
+struct TCPListener {
+	private {
+		StreamListenSocketFD m_socket;
+	}
+
+	this(StreamListenSocketFD socket)
+	{
+		m_socket = socket;
+	}
+
 	/// The local address at which TCP connections are accepted.
-	@property NetworkAddress bindAddress();
+	@property NetworkAddress bindAddress()
+	{
+		assert(false);
+	}
 
 	/// Stops listening and closes the socket.
-	void stopListening();
+	void stopListening()
+	{
+		assert(false);
+	}
 }
 
 
 /**
 	Represents a bound and possibly 'connected' UDP socket.
 */
-interface UDPConnection {
+struct UDPConnection {
 	/** Returns the address to which the UDP socket is bound.
 	*/
-	@property string bindAddress() const;
+	@property string bindAddress() const { assert(false); }
 
 	/** Determines if the socket is allowed to send to broadcast addresses.
 	*/
-	@property bool canBroadcast() const;
+	@property bool canBroadcast() const { assert(false); }
 	/// ditto
-	@property void canBroadcast(bool val);
+	@property void canBroadcast(bool val) { assert(false); }
 
 	/// The local/bind address of the underlying socket.
-	@property NetworkAddress localAddress() const;
+	@property NetworkAddress localAddress() const { assert(false); }
 
 	/** Stops listening for datagrams and frees all resources.
 	*/
-	void close();
+	void close() { assert(false); }
 
 	/** Locks the UDP connection to a certain peer.
 
 		Once connected, the UDPConnection can only communicate with the specified peer.
 		Otherwise communication with any reachable peer is possible.
 	*/
-	void connect(string host, ushort port);
+	void connect(string host, ushort port) { assert(false); }
 	/// ditto
-	void connect(NetworkAddress address);
+	void connect(NetworkAddress address) { assert(false); }
 
 	/** Sends a single packet.
 
 		If peer_address is given, the packet is send to that address. Otherwise the packet
 		will be sent to the address specified by a call to connect().
 	*/
-	void send(in ubyte[] data, in NetworkAddress* peer_address = null);
+	void send(in ubyte[] data, in NetworkAddress* peer_address = null) { assert(false); }
 
 	/** Receives a single packet.
 
@@ -363,9 +501,9 @@ interface UDPConnection {
 		The timeout overload will throw an Exception if no data arrives before the
 		specified duration has elapsed.
 	*/
-	ubyte[] recv(ubyte[] buf = null, NetworkAddress* peer_address = null);
+	ubyte[] recv(ubyte[] buf = null, NetworkAddress* peer_address = null) { assert(false); }
 	/// ditto
-	ubyte[] recv(Duration timeout, ubyte[] buf = null, NetworkAddress* peer_address = null);
+	ubyte[] recv(Duration timeout, ubyte[] buf = null, NetworkAddress* peer_address = null) { assert(false); }
 }
 
 
@@ -379,10 +517,6 @@ enum TCPListenOptions {
 	distribute = 1<<0,
 	/// Disables automatic closing of the connection when the connection callback exits
 	disableAutoClose = 1<<1,
-	/** Enable port reuse on linux kernel version >=3.9, do nothing on other OS
-	    Does not affect libasync driver because it is always enabled by libasync.
-	*/
-	reusePort = 1<<2,
 }
 
 private pure nothrow {
@@ -402,3 +536,5 @@ private pure nothrow {
 		else static assert(false, "Unknown endianness.");
 	}
 }
+
+private enum tracer = "";

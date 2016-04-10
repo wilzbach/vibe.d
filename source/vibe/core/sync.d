@@ -1,19 +1,19 @@
 /**
 	Interruptible Task synchronization facilities
 
-	Copyright: © 2012-2015 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	Authors: Leonid Kramer, Sönke Ludwig, Manuel Frischknecht
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
 module vibe.core.sync;
 
-import std.exception;
-
-import vibe.core.driver;
+import vibe.core.task;
 
 import core.atomic;
 import core.sync.mutex;
 import core.sync.condition;
+import eventcore.core;
+import std.exception;
 import std.stdio;
 import std.traits : ReturnType;
 
@@ -94,7 +94,7 @@ struct ScopedMutexLock
 		Returns the value returned from $(D PROC), if any.
 */
 /// private
-package(vibe) ReturnType!PROC performLocked(alias PROC, MUTEX)(MUTEX mutex)
+ReturnType!PROC performLocked(alias PROC, MUTEX)(MUTEX mutex)
 {
 	mutex.lock();
 	scope (exit) mutex.unlock();
@@ -123,7 +123,7 @@ class LocalTaskSemaphore
 	// requires a queue
 	import std.container.binaryheap;
 	import std.container.array;
-	import vibe.utils.memory;
+	//import vibe.utils.memory;
 
 	private {
 		struct Waiter {
@@ -176,14 +176,14 @@ class LocalTaskSemaphore
 		until the number of locks drops below the limit.
 	*/
 	void lock(ubyte priority = 0)
-	{ 
-		import std.algorithm : min;
+	{
+		import std.algorithm.comparison : min;
 
 		if (tryLock())
 			return;
 		
 		Waiter w;
-		w.signal = getEventDriver().createManualEvent();
+		w.signal = createManualEvent();
 		w.priority = priority;
 		w.seq = min(0, m_seq - w.priority);
 		if (++m_seq == uint.max)
@@ -301,6 +301,7 @@ unittest {
 	}
 }
 
+version (VibeLibevDriver) {} else // timers are not implemented for libev, yet
 unittest { // test deferred throwing
 	import vibe.core.core;
 
@@ -337,6 +338,7 @@ unittest { // test deferred throwing
 	runEventLoop();
 }
 
+version (VibeLibevDriver) {} else // timers are not implemented for libev, yet
 unittest {
 	runMutexUnitTests!TaskMutex();
 }
@@ -361,6 +363,7 @@ final class InterruptibleTaskMutex : Lockable {
 	void unlock() nothrow { m_impl.unlock(); }
 }
 
+version (VibeLibevDriver) {} else // timers are not implemented for libev, yet
 unittest {
 	runMutexUnitTests!InterruptibleTaskMutex();
 }
@@ -395,6 +398,7 @@ class RecursiveTaskMutex : core.sync.mutex.Mutex, Lockable {
 	override void unlock() { m_impl.unlock(); }
 }
 
+version (VibeLibevDriver) {} else // timers are not implemented for libev, yet
 unittest {
 	runMutexUnitTests!RecursiveTaskMutex();
 }
@@ -419,6 +423,7 @@ final class InterruptibleRecursiveTaskMutex : Lockable {
 	void unlock() { m_impl.unlock(); }
 }
 
+version (VibeLibevDriver) {} else // timers are not implemented for libev, yet
 unittest {
 	runMutexUnitTests!InterruptibleRecursiveTaskMutex();
 }
@@ -546,12 +551,11 @@ private void runMutexUnitTests(M)()
 class TaskCondition : core.sync.condition.Condition {
 	private TaskConditionImpl!(false, Mutex) m_impl;
 
-	static if (__VERSION__ >= 2067)
-		this(core.sync.mutex.Mutex mtx) nothrow { m_impl.setup(mtx); super(mtx); }
-	else
-		this(core.sync.mutex.Mutex mtx) { m_impl.setup(mtx); super(mtx); }
-
-	override @property Mutex mutex() nothrow { return m_impl.mutex; }
+	this(core.sync.mutex.Mutex mtx) {
+		m_impl.setup(mtx);
+		super(mtx);
+	}
+	override @property Mutex mutex() { return m_impl.mutex; }
 	override void wait() { m_impl.wait(); }
 	override bool wait(Duration timeout) { return m_impl.wait(timeout); }
 	override void notify() { m_impl.notify(); }
@@ -611,8 +615,8 @@ unittest {
 final class InterruptibleTaskCondition {
 	private TaskConditionImpl!(true, Lockable) m_impl;
 
-	this(core.sync.mutex.Mutex mtx) nothrow { m_impl.setup(mtx); }
-	this(Lockable mtx) nothrow { m_impl.setup(mtx); }
+	this(core.sync.mutex.Mutex mtx) { m_impl.setup(mtx); }
+	this(Lockable mtx) { m_impl.setup(mtx); }
 
 	@property Lockable mutex() { return m_impl.mutex; }
 	void wait() { m_impl.wait(); }
@@ -625,15 +629,26 @@ final class InterruptibleTaskCondition {
 /** Creates a new signal that can be shared between fibers.
 */
 ManualEvent createManualEvent()
-nothrow {
-	return getEventDriver().createManualEvent();
+{
+	return ManualEvent.init;
 }
 
 /** A manually triggered cross-task event.
 
 	Note: the ownership can be shared between multiple fibers and threads.
 */
-interface ManualEvent {
+struct ManualEvent {
+	bool opCast() const nothrow { return true; }
+	int emitCount() const nothrow { return 0; }
+	int emit() nothrow { return 0; }
+	int wait() { assert(false); }
+	int wait(int) { import vibe.core.core : sleep; sleep(30.seconds); assert(false); }
+	int wait(Duration, int) { assert(false); }
+	int waitUninterruptible() nothrow { assert(false); }
+	int waitUninterruptible(int) nothrow { assert(false); }
+	int waitUninterruptible(Duration, int) nothrow { assert(false); }
+}
+/+interface ManualEvent {
 	/// A counter that is increased with every emit() call
 	@property int emitCount() const nothrow;
 
@@ -673,7 +688,7 @@ interface ManualEvent {
 
 	/// ditto
 	int waitUninterruptible(Duration timeout, int reference_emit_count) nothrow;
-}
+}+/
 
 
 private struct TaskMutexImpl(bool INTERRUPTIBLE) {
@@ -686,7 +701,7 @@ private struct TaskMutexImpl(bool INTERRUPTIBLE) {
 	}
 
 	void setup()
-	nothrow {
+	{
 		m_signal = createManualEvent();
 	}
 

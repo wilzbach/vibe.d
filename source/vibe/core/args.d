@@ -7,14 +7,14 @@
 	to their values. It is searched for in the local directory, user's home
 	directory, or /etc/vibe/ (POSIX only), whichever is found first.
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Vladimir Panteleev
 */
 module vibe.core.args;
 
 import vibe.core.log;
-import vibe.data.json;
+//import vibe.data.json;
 
 import std.algorithm : any, map, sort;
 import std.array : array, join, replicate, split;
@@ -60,13 +60,13 @@ bool readOption(T)(string names, T* pvalue, string help_text)
 	getopt(g_args, getoptConfig, names, pvalue);
 	if (g_args.length < olen) return true;
 
-	if (g_haveConfig) {
+	/*if (g_haveConfig) {
 		foreach (name; info.names)
 			if (auto pv = name in g_config) {
 				*pvalue = pv.to!T;
 				return true;
 			}
-	}
+	}*/
 
 	return false;
 }
@@ -175,7 +175,7 @@ private struct OptionInfo {
 private {
 	__gshared string[] g_args;
 	__gshared bool g_haveConfig;
-	__gshared Json g_config;
+	//__gshared Json g_config;
 	__gshared OptionInfo[] g_options;
 	__gshared bool g_help;
 }
@@ -206,7 +206,7 @@ private void init()
 		if (cpath.exists) {
 			scope(failure) logError("Failed to parse config file %s.", cpath);
 			auto text = cpath.readText();
-			g_config = text.parseJson();
+			//g_config = text.parseJson();
 			g_haveConfig = true;
 			break;
 		}
