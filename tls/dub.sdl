@@ -22,6 +22,7 @@ configuration "openssl-mscoff" {
 configuration "openssl" {
 	sourceFiles "../lib/win-i386/eay.lib" "../lib/win-i386/ssl.lib" platform="windows-x86-dmd"
 	dependency "openssl" version="~>1.0"
+	preBuildCommands "./test.sh"
 }
 
 configuration "openssl-1.1" {

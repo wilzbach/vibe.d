@@ -7,6 +7,7 @@
 */
 module vibe.stream.openssl;
 version(Have_openssl):
+import vibe.detect_openssl11;
 import vibe.core.log;
 import vibe.core.net;
 import vibe.core.stream;
@@ -47,8 +48,19 @@ version(VibeForceALPN) enum alpn_forced = true;
 else enum alpn_forced = false;
 enum haveALPN = OPENSSL_VERSION_NUMBER >= 0x10200000 || alpn_forced;
 
-// openssl 1.1.0 hack: provides a 1.0.x API in terms of the 1.1.x API
+// detect OpenSSL11 at compile-time
 version (VibeUseOpenSSL11) {
+	private enum useVibeUseOpenSSL11 = 1;
+} else {
+	static if (__traits(compiles, detectedOpenSSL11)) {
+	private enum useVibeUseOpenSSL11 = 1;
+	} else {
+	private enum useVibeUseOpenSSL11 = 0;
+	}
+}
+
+// openssl 1.1.0 hack: provides a 1.0.x API in terms of the 1.1.x API
+static if(useVibeUseOpenSSL11) {
 	extern(C) const(SSL_METHOD)* TLS_client_method();
 	alias SSLv23_client_method = TLS_client_method;
 
